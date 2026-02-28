@@ -1,0 +1,34 @@
+syntax = "proto3";
+package blaster;
+
+message BlastPacket {
+  uint64 sequence_id = 1;
+  uint64 timestamp_ns = 2;
+  uint32 payload_size = 3;
+  bytes  payload = 4;
+}
+
+message BlastAck {
+  uint64 sequence_id = 1;
+  uint64 received_at_ns = 2;
+}
+
+message ReportRequest {
+  string session_id = 1;
+}
+
+message ArrivalEntry {
+  uint64 sequence_id = 1;
+  uint64 grpc_arrival_ns = 2;
+  uint64 quic_arrival_ns = 3;
+  uint32 payload_size = 4;
+}
+
+message BenchmarkReport {
+  repeated ArrivalEntry arrivals = 1;
+}
+
+service BlasterService {
+  rpc BlastStream (stream BlastPacket) returns (stream BlastAck);
+  rpc GetReport (ReportRequest) returns (BenchmarkReport);
+}

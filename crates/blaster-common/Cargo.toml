@@ -1,0 +1,18 @@
+[package]
+name = "blaster-common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+quinn = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+hdrhistogram = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "blaster-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blaster-common = { path = "../blaster-common" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+quinn = { workspace = true }
+clap = { workspace = true }
+hdrhistogram = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio-stream = "0.1"
