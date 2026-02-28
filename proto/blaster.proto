@@ -22,10 +22,21 @@ message ArrivalEntry {
   uint64 grpc_arrival_ns = 2;
   uint64 quic_arrival_ns = 3;
   uint32 payload_size = 4;
+  uint64 tcp_arrival_ns = 5;
+}
+
+message SerdeStatsProto {
+  uint64 count = 1;
+  uint64 median_ns = 2;
+  uint64 min_ns = 3;
+  uint64 max_ns = 4;
+  double mean_ns = 5;
 }
 
 message BenchmarkReport {
   repeated ArrivalEntry arrivals = 1;
+  SerdeStatsProto quic_decode_stats = 2;
+  SerdeStatsProto tcp_decode_stats = 3;
 }
 
 service BlasterService {

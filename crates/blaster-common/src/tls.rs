@@ -1,6 +1,7 @@
 use anyhow::Result;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use std::net::UdpSocket;
 use std::sync::Arc;
 
 pub struct CertPair {
@@ -18,24 +19,82 @@ pub fn generate_self_signed() -> Result<CertPair> {
     })
 }
 
+/// Enlarge the OS-level UDP socket buffers (SO_SNDBUF / SO_RCVBUF).
+/// The kernel default (~208 KB) is a bottleneck for high-throughput QUIC.
+/// Errors are logged but not fatal — the kernel may cap to rmem_max/wmem_max.
+pub fn enlarge_socket_buffers(socket: &UdpSocket, size: usize) {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        let val = size as libc::c_int;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            tracing::warn!(
+                "setsockopt({}) failed: {}",
+                if opt == libc::SO_SNDBUF { "SO_SNDBUF" } else { "SO_RCVBUF" },
+                std::io::Error::last_os_error(),
+            );
+        }
+    }
+}
+
+/// Endpoint config tuned for large payloads.
+pub fn blaster_endpoint_config() -> quinn::EndpointConfig {
+    let mut config = quinn::EndpointConfig::default();
+    // Raise max UDP payload from 1472 to 65527 (max allowed).
+    // PMTU discovery will negotiate the actual path MTU down if needed.
+    let _ = config.max_udp_payload_size(65527);
+    config
+}
+
 fn blaster_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
-    // 64MB stream receive window (default ~1MB) — prevents flow control stalls on large payloads
-    transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-    // 64MB connection-level receive window
-    transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-    // 64MB send window
-    transport.send_window(64 * 1024 * 1024);
-    // Large initial congestion window via Cubic config (default ~14KB)
-    let mut cubic = quinn::congestion::CubicConfig::default();
-    cubic.initial_window(10 * 1024 * 1024);
-    transport.congestion_controller_factory(Arc::new(cubic));
+
+    // ── Flow-control windows (sized for 10 MB+ payloads) ─────────────
+    // 128 MB stream receive window (default ~1 MB)
+    transport.stream_receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024));
+    // 256 MB connection-level receive window (covers multiple concurrent streams)
+    transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
+    // 128 MB send window
+    transport.send_window(128 * 1024 * 1024);
+
+    // ── Congestion control ───────────────────────────────────────────
+    // BBR is rate-based (not loss-based like Cubic) — it probes available
+    // bandwidth directly, so it fills the pipe on the first RTT instead of
+    // slowly ramping up.  Much better for large payloads on fast links.
+    let mut bbr = quinn::congestion::BbrConfig::default();
+    bbr.initial_window(32 * 1024 * 1024);
+    transport.congestion_controller_factory(Arc::new(bbr));
+
+    // ── Timeouts & keep-alive ────────────────────────────────────────
+    // 60 s idle timeout — large transfers may stall briefly between chunks
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(60)).unwrap(),
+    ));
+    // Keep-alive every 15 s to prevent NAT/firewall timeouts
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+
+    // ── MTU ──────────────────────────────────────────────────────────
+    // Use 1400-byte initial MTU (safe for most paths) with PMTU discovery
+    transport.initial_mtu(1400);
+    transport.min_mtu(1200);
+
+    // ── Streams & misc ───────────────────────────────────────────────
     // Disable datagram buffer (we use streams only)
     transport.datagram_receive_buffer_size(None);
     // Enable GSO if available
     transport.enable_segmentation_offload(true);
-    // Allow up to 1024 concurrent bidirectional streams per connection
-    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
+    // Allow up to 2048 concurrent unidirectional streams per connection
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(2048));
+
     transport
 }
 

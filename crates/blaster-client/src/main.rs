@@ -1,6 +1,7 @@
 mod grpc_client;
 mod orchestrator;
 mod quic_client;
+mod tcp_client;
 
 use clap::Parser;
 use std::net::SocketAddr;
@@ -24,6 +25,10 @@ struct Args {
     /// QUIC server port
     #[arg(long, default_value = "50052")]
     quic_port: u16,
+
+    /// Raw TCP server port
+    #[arg(long, default_value = "50053")]
+    tcp_port: u16,
 
     /// Comma-separated payload sizes (1kb,10kb,100kb,1mb,10mb)
     #[arg(long, default_value = "1kb,10kb,100kb,1mb,10mb")]
@@ -56,12 +61,14 @@ async fn main() -> anyhow::Result<()> {
 
     let grpc_addr = format!("{}:{}", args.target, args.grpc_port);
     let quic_addr: SocketAddr = format!("{}:{}", args.target, args.quic_port).parse()?;
+    let tcp_addr: SocketAddr = format!("{}:{}", args.target, args.tcp_port).parse()?;
 
     println!("Blaster Benchmark");
     println!("═════════════════");
     println!("  Target:      {}", args.target);
     println!("  gRPC:        {}", grpc_addr);
     println!("  QUIC:        {}", quic_addr);
+    println!("  TCP:         {}", tcp_addr);
     println!("  Sizes:       {:?}", sizes.iter().map(|(n, _)| *n).collect::<Vec<_>>());
     println!("  Packets/size: {}", args.packets_per_size);
     println!("  QUIC streams: {}", args.quic_streams);
@@ -71,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
     let config = BenchmarkConfig {
         grpc_addr,
         quic_addr,
+        tcp_addr,
         sizes,
         packets_per_size: args.packets_per_size,
         quic_streams: args.quic_streams,

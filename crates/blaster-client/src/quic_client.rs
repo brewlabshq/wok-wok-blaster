@@ -1,16 +1,18 @@
 use anyhow::Result;
 use blaster_common::metrics::MetricsCollector;
-use blaster_common::proto::{BlastAck, BlastPacket};
+use blaster_common::serde_metrics::SerdeMetrics;
 use blaster_common::tls;
-use prost::Message;
+use blaster_common::wire;
 use quinn::Endpoint;
 use std::net::SocketAddr;
 use std::time::Instant;
+
 pub struct QuicResult {
     pub metrics: MetricsCollector,
     pub elapsed: std::time::Duration,
     pub lost_packets: u64,
     pub sent_packets: u64,
+    pub encode_metrics: SerdeMetrics,
 }
 
 pub async fn blast_quic(
@@ -21,7 +23,17 @@ pub async fn blast_quic(
 ) -> Result<QuicResult> {
     let client_config = tls::client_config()?;
 
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_nonblocking(true)?;
+    tls::enlarge_socket_buffers(&socket, 8 * 1024 * 1024);
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| anyhow::anyhow!("no async runtime"))?;
+    let mut endpoint = Endpoint::new(
+        tls::blaster_endpoint_config(),
+        None,
+        socket,
+        runtime,
+    )?;
     endpoint.set_default_client_config(client_config);
 
     let conn = endpoint.connect(target, "localhost")?.await?;
@@ -29,40 +41,30 @@ pub async fn blast_quic(
     let total = payloads.len();
     let total_bytes: u64 = payloads.iter().map(|(_, p)| p.len() as u64).sum();
     let num_streams = num_streams.max(1).min(total);
+    let encode_metrics = SerdeMetrics::new();
 
-    // Wait for barrier so both transports start simultaneously
     barrier.wait().await;
     let start = Instant::now();
 
     if num_streams <= 1 {
-        // Single-stream path (original behavior)
-        blast_single_stream(&conn, payloads).await?;
+        blast_single_stream(&conn, payloads, &encode_metrics).await?;
     } else {
-        // Multi-stream multiplexing: split payloads across N streams
-        blast_multi_stream(&conn, payloads, num_streams).await?;
+        blast_multi_stream(&conn, payloads, num_streams, &encode_metrics).await?;
     }
 
     let elapsed = start.elapsed();
 
-    // Metrics are collected per-stream and merged — for now we use elapsed time
-    // The per-packet latencies were captured inside the stream handlers
     let mut metrics = MetricsCollector::new();
     metrics.add_bytes(total_bytes);
-    // Record overall throughput as a single latency sample (total elapsed)
-    // Individual per-packet latencies come from the stream tasks
     let elapsed_ns = elapsed.as_nanos() as u64;
-    // We'll record one latency entry per packet based on elapsed / total
-    // This is approximate; true per-packet latency requires more plumbing
     for _ in 0..total {
         metrics.record_latency_ns(elapsed_ns / total as u64);
     }
 
-    // Get connection stats for packet drop info
     let stats = conn.stats();
     let lost_packets = stats.path.lost_packets;
     let sent_packets = stats.path.sent_packets;
 
-    // Close cleanly
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
 
@@ -71,6 +73,7 @@ pub async fn blast_quic(
         elapsed,
         lost_packets,
         sent_packets,
+        encode_metrics,
     })
 }
 
@@ -85,23 +88,20 @@ pub async fn blast_quic_0rtt(
     let total = payloads.len();
     let total_bytes: u64 = payloads.iter().map(|(_, p)| p.len() as u64).sum();
     let num_streams = num_streams.max(1).min(total);
+    let encode_metrics = SerdeMetrics::new();
 
     let connecting = endpoint.connect(target, "localhost")?;
 
-    // Try 0-RTT: if we have a cached session ticket, we can start sending immediately
     let conn = match connecting.into_0rtt() {
         Ok((conn, zero_rtt_accepted)) => {
             tracing::info!("QUIC 0-RTT connection initiated");
-            // Wait for barrier
             barrier.wait().await;
             let start_accept = Instant::now();
-            // Wait for 0-RTT acceptance (server must agree)
             zero_rtt_accepted.await;
             tracing::info!("0-RTT accepted in {:?}", start_accept.elapsed());
             conn
         }
         Err(connecting) => {
-            // No cached session — fall back to full 1-RTT handshake
             tracing::info!("No 0-RTT session ticket, falling back to 1-RTT");
             let conn = connecting.await?;
             barrier.wait().await;
@@ -112,9 +112,9 @@ pub async fn blast_quic_0rtt(
     let start = Instant::now();
 
     if num_streams <= 1 {
-        blast_single_stream(&conn, payloads).await?;
+        blast_single_stream(&conn, payloads, &encode_metrics).await?;
     } else {
-        blast_multi_stream(&conn, payloads, num_streams).await?;
+        blast_multi_stream(&conn, payloads, num_streams, &encode_metrics).await?;
     }
 
     let elapsed = start.elapsed();
@@ -137,61 +137,35 @@ pub async fn blast_quic_0rtt(
         elapsed,
         lost_packets,
         sent_packets,
+        encode_metrics,
     })
 }
 
-/// Single-stream: send all packets on one bidirectional stream
+/// One uni stream per packet. The stream IS the delimiter —
+/// write bincode bytes, finish the stream, no header needed.
 async fn blast_single_stream(
     conn: &quinn::Connection,
     payloads: Vec<(u64, Vec<u8>)>,
+    encode_metrics: &SerdeMetrics,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    let total = payloads.len();
-
-    // Spawn ack reader concurrently with sending
-    let recv_handle = tokio::spawn(async move {
-        for _ in 0..total {
-            let mut len_buf = [0u8; 4];
-            recv.read_exact(&mut len_buf).await?;
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
-            let mut msg_buf = vec![0u8; msg_len];
-            recv.read_exact(&mut msg_buf).await?;
-            let _ack = BlastAck::decode(&msg_buf[..])?;
-        }
-        Ok::<(), anyhow::Error>(())
-    });
-
-    // Send all packets
-    for (seq_id, payload) in &payloads {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
-        let packet = BlastPacket {
-            sequence_id: *seq_id,
-            timestamp_ns: now,
-            payload_size: payload.len() as u32,
-            payload: payload.clone(),
-        };
-
-        let msg = packet.encode_to_vec();
-        let len = (msg.len() as u32).to_be_bytes();
-        send.write_all(&len).await?;
+    for (seq_id, payload) in payloads {
+        let mut send = conn.open_uni().await?;
+        let msg = wire::encode_and_serialize(seq_id, payload, encode_metrics);
         send.write_all(&msg).await?;
+        send.finish()?;
     }
 
-    recv_handle.await??;
     Ok(())
 }
 
-/// Multi-stream: split payloads into chunks and send each chunk on its own bidi stream
+/// Multi-stream: split payloads across N concurrent tasks, each opening
+/// uni streams for its chunk of packets.
 async fn blast_multi_stream(
     conn: &quinn::Connection,
     payloads: Vec<(u64, Vec<u8>)>,
     num_streams: usize,
+    encode_metrics: &SerdeMetrics,
 ) -> Result<()> {
-    // Split payloads into roughly equal chunks across streams
     let chunk_size = (payloads.len() + num_streams - 1) / num_streams;
     let chunks: Vec<Vec<(u64, Vec<u8>)>> = payloads
         .chunks(chunk_size)
@@ -209,50 +183,19 @@ async fn blast_multi_stream(
 
     for chunk in chunks {
         let conn = conn.clone();
+        let em = encode_metrics.clone();
         let handle = tokio::spawn(async move {
-            let (mut send, mut recv) = conn.open_bi().await?;
-            let chunk_len = chunk.len();
-
-            // Spawn ack reader for this stream
-            let ack_handle = tokio::spawn(async move {
-                for _ in 0..chunk_len {
-                    let mut len_buf = [0u8; 4];
-                    recv.read_exact(&mut len_buf).await?;
-                    let msg_len = u32::from_be_bytes(len_buf) as usize;
-                    let mut msg_buf = vec![0u8; msg_len];
-                    recv.read_exact(&mut msg_buf).await?;
-                    let _ack = BlastAck::decode(&msg_buf[..])?;
-                }
-                Ok::<(), anyhow::Error>(())
-            });
-
-            // Send packets on this stream
-            for (seq_id, payload) in &chunk {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64;
-
-                let packet = BlastPacket {
-                    sequence_id: *seq_id,
-                    timestamp_ns: now,
-                    payload_size: payload.len() as u32,
-                    payload: payload.clone(),
-                };
-
-                let msg = packet.encode_to_vec();
-                let len = (msg.len() as u32).to_be_bytes();
-                send.write_all(&len).await?;
+            for (seq_id, payload) in chunk {
+                let mut send = conn.open_uni().await?;
+                let msg = wire::encode_and_serialize(seq_id, payload, &em);
                 send.write_all(&msg).await?;
+                send.finish()?;
             }
-
-            ack_handle.await??;
             Ok::<(), anyhow::Error>(())
         });
         handles.push(handle);
     }
 
-    // Wait for all stream tasks to complete
     for handle in handles {
         handle.await??;
     }
