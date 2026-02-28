@@ -34,6 +34,8 @@ fn blaster_transport_config() -> quinn::TransportConfig {
     transport.datagram_receive_buffer_size(None);
     // Enable GSO if available
     transport.enable_segmentation_offload(true);
+    // Allow up to 1024 concurrent bidirectional streams per connection
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
     transport
 }
 
@@ -42,6 +44,10 @@ pub fn server_config(pair: &CertPair) -> Result<quinn::ServerConfig> {
         .with_no_client_auth()
         .with_single_cert(vec![pair.cert.clone()], pair.key.clone_key().into())?;
     server_crypto.alpn_protocols = vec![b"blaster".to_vec()];
+    // Enable 0-RTT early data (max u32 = unlimited)
+    server_crypto.max_early_data_size = u32::MAX;
+    // Send two session tickets per connection for 0-RTT resumption
+    server_crypto.send_tls13_tickets = 2;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
@@ -56,6 +62,10 @@ pub fn client_config() -> Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(SkipVerification))
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![b"blaster".to_vec()];
+    // Enable session resumption with in-memory cache (needed for 0-RTT)
+    client_crypto.resumption = rustls::client::Resumption::in_memory_sessions(256);
+    // Enable early data (0-RTT) on the client
+    client_crypto.enable_early_data = true;
 
     let mut client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));

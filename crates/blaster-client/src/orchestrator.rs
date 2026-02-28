@@ -23,16 +23,55 @@ pub struct BenchmarkConfig {
     pub quic_addr: SocketAddr,
     pub sizes: Vec<(&'static str, usize)>,
     pub packets_per_size: usize,
+    pub quic_streams: usize,
+    pub zero_rtt: bool,
 }
 
 pub async fn run_benchmark(config: BenchmarkConfig) -> Result<Vec<SizeTierResult>> {
     let mut results = Vec::new();
 
+    // Create a persistent QUIC endpoint that survives across size tiers.
+    // This lets session tickets accumulate so 0-RTT works on the 2nd+ tier.
+    let client_config = blaster_common::tls::client_config()?;
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_config);
+
+    // If 0-RTT is enabled, do a warmup handshake to get a session ticket
+    if config.zero_rtt {
+        tracing::info!("0-RTT warmup: establishing initial connection to get session ticket...");
+        let warmup_conn = endpoint.connect(config.quic_addr, "localhost")?.await?;
+        // Send a tiny packet and wait for ack to ensure ticket is issued
+        let (mut send, mut recv) = warmup_conn.open_bi().await?;
+        use blaster_common::proto::BlastPacket;
+        use prost::Message;
+        let warmup_packet = BlastPacket {
+            sequence_id: u64::MAX, // sentinel value
+            timestamp_ns: 0,
+            payload_size: 1,
+            payload: vec![0u8],
+        };
+        let msg = warmup_packet.encode_to_vec();
+        let len = (msg.len() as u32).to_be_bytes();
+        send.write_all(&len).await?;
+        send.write_all(&msg).await?;
+        // Read ack
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        let mut msg_buf = vec![0u8; msg_len];
+        recv.read_exact(&mut msg_buf).await?;
+        // Close warmup connection — session ticket is now cached in the endpoint
+        warmup_conn.close(0u32.into(), b"warmup");
+        endpoint.wait_idle().await;
+        tracing::info!("0-RTT warmup complete — session ticket cached");
+    }
+
     for (size_name, size_bytes) in &config.sizes {
         tracing::info!(
-            "Benchmarking {} ({} packets)...",
+            "Benchmarking {} ({} packets, {} streams)...",
             size_name,
-            config.packets_per_size
+            config.packets_per_size,
+            config.quic_streams,
         );
 
         let payloads = datagen::generate_payloads(*size_bytes, config.packets_per_size);
@@ -48,7 +87,6 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<Vec<SizeTierResult
         let barrier = Arc::new(Barrier::new(2));
 
         let grpc_addr = config.grpc_addr.clone();
-        let quic_addr = config.quic_addr;
         let grpc_barrier = barrier.clone();
         let quic_barrier = barrier;
 
@@ -56,8 +94,23 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<Vec<SizeTierResult
             grpc_client::blast_grpc(grpc_addr, grpc_payloads, grpc_barrier).await
         });
 
+        let quic_streams = config.quic_streams;
+        let quic_addr = config.quic_addr;
+        let zero_rtt = config.zero_rtt;
+        let endpoint_clone = endpoint.clone();
         let quic_handle = tokio::spawn(async move {
-            quic_client::blast_quic(quic_addr, quic_payloads, quic_barrier).await
+            if zero_rtt {
+                quic_client::blast_quic_0rtt(
+                    quic_addr,
+                    quic_payloads,
+                    quic_barrier,
+                    quic_streams,
+                    &endpoint_clone,
+                )
+                .await
+            } else {
+                quic_client::blast_quic(quic_addr, quic_payloads, quic_barrier, quic_streams).await
+            }
         });
 
         let (grpc_result, quic_result) = tokio::try_join!(grpc_handle, quic_handle)?;

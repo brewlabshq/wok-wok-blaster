@@ -32,6 +32,14 @@ struct Args {
     /// Number of packets per payload size
     #[arg(long, default_value = "100")]
     packets_per_size: usize,
+
+    /// Number of concurrent QUIC streams for multiplexing (1 = single stream)
+    #[arg(long, default_value = "1")]
+    quic_streams: usize,
+
+    /// Enable 0-RTT for QUIC (makes a warmup connection first to get session ticket)
+    #[arg(long, default_value = "false")]
+    zero_rtt: bool,
 }
 
 #[tokio::main]
@@ -56,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
     println!("  QUIC:        {}", quic_addr);
     println!("  Sizes:       {:?}", sizes.iter().map(|(n, _)| *n).collect::<Vec<_>>());
     println!("  Packets/size: {}", args.packets_per_size);
+    println!("  QUIC streams: {}", args.quic_streams);
+    println!("  0-RTT:        {}", args.zero_rtt);
     println!();
 
     let config = BenchmarkConfig {
@@ -63,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
         quic_addr,
         sizes,
         packets_per_size: args.packets_per_size,
+        quic_streams: args.quic_streams,
+        zero_rtt: args.zero_rtt,
     };
 
     let results = run_benchmark(config).await?;
