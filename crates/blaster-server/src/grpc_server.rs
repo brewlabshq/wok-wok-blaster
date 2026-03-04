@@ -1,6 +1,6 @@
 use blaster_common::proto::blaster_service_server::BlasterService;
 use blaster_common::proto::{
-    ArrivalEntry, BenchmarkReport, BlastAck, BlastPacket, ReportRequest,
+    ArrivalEntry, BenchmarkReport, BlastAck, BlastPacket, ReportRequest, SerdeStatsProto,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -70,10 +70,30 @@ impl BlasterService for BlasterGrpcService {
                 sequence_id: seq_id,
                 grpc_arrival_ns: record.grpc_arrival_ns.unwrap_or(0),
                 quic_arrival_ns: record.quic_arrival_ns.unwrap_or(0),
+                tcp_arrival_ns: record.tcp_arrival_ns.unwrap_or(0),
                 payload_size: record.payload_size,
             })
             .collect();
 
-        Ok(Response::new(BenchmarkReport { arrivals }))
+        let quic_stats = self.tracker.quic_decode_metrics.stats();
+        let tcp_stats = self.tracker.tcp_decode_metrics.stats();
+
+        Ok(Response::new(BenchmarkReport {
+            arrivals,
+            quic_decode_stats: Some(SerdeStatsProto {
+                count: quic_stats.count as u64,
+                median_ns: quic_stats.median_ns,
+                min_ns: quic_stats.min_ns,
+                max_ns: quic_stats.max_ns,
+                mean_ns: quic_stats.mean_ns,
+            }),
+            tcp_decode_stats: Some(SerdeStatsProto {
+                count: tcp_stats.count as u64,
+                median_ns: tcp_stats.median_ns,
+                min_ns: tcp_stats.min_ns,
+                max_ns: tcp_stats.max_ns,
+                mean_ns: tcp_stats.mean_ns,
+            }),
+        }))
     }
 }

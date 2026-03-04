@@ -1,3 +1,4 @@
+use blaster_common::serde_metrics::SerdeMetrics;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct ArrivalRecord {
     pub grpc_arrival_ns: Option<u64>,
     pub quic_arrival_ns: Option<u64>,
+    pub tcp_arrival_ns: Option<u64>,
     pub payload_size: u32,
 }
 
@@ -13,17 +15,22 @@ pub struct ArrivalRecord {
 pub enum Transport {
     Grpc,
     Quic,
+    Tcp,
 }
 
 #[derive(Clone)]
 pub struct ArrivalTracker {
     records: Arc<DashMap<u64, ArrivalRecord>>,
+    pub quic_decode_metrics: SerdeMetrics,
+    pub tcp_decode_metrics: SerdeMetrics,
 }
 
 impl ArrivalTracker {
     pub fn new() -> Self {
         Self {
             records: Arc::new(DashMap::new()),
+            quic_decode_metrics: SerdeMetrics::new(),
+            tcp_decode_metrics: SerdeMetrics::new(),
         }
     }
 
@@ -34,16 +41,19 @@ impl ArrivalTracker {
             .and_modify(|r| match transport {
                 Transport::Grpc => r.grpc_arrival_ns = Some(now),
                 Transport::Quic => r.quic_arrival_ns = Some(now),
+                Transport::Tcp => r.tcp_arrival_ns = Some(now),
             })
             .or_insert_with(|| {
                 let mut rec = ArrivalRecord {
                     grpc_arrival_ns: None,
                     quic_arrival_ns: None,
+                    tcp_arrival_ns: None,
                     payload_size,
                 };
                 match transport {
                     Transport::Grpc => rec.grpc_arrival_ns = Some(now),
                     Transport::Quic => rec.quic_arrival_ns = Some(now),
+                    Transport::Tcp => rec.tcp_arrival_ns = Some(now),
                 }
                 rec
             });

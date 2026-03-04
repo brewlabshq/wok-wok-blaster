@@ -12,6 +12,8 @@ quinn = { workspace = true }
 clap = { workspace = true }
 dashmap = { workspace = true }
 anyhow = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-stream = "0.1"

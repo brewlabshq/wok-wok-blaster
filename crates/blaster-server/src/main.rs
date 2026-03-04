@@ -1,5 +1,6 @@
 mod grpc_server;
 mod quic_server;
+mod tcp_server;
 mod tracker;
 
 use std::net::SocketAddr;
@@ -21,6 +22,9 @@ struct Args {
     #[arg(long, default_value = "50052")]
     quic_port: u16,
 
+    #[arg(long, default_value = "50053")]
+    tcp_port: u16,
+
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 }
@@ -34,12 +38,15 @@ async fn main() -> anyhow::Result<()> {
 
     let grpc_addr: SocketAddr = format!("{}:{}", args.bind, args.grpc_port).parse()?;
     let quic_addr: SocketAddr = format!("{}:{}", args.bind, args.quic_port).parse()?;
+    let tcp_addr: SocketAddr = format!("{}:{}", args.bind, args.tcp_port).parse()?;
 
     tracing::info!("Starting blaster server");
     tracing::info!("  gRPC: {}", grpc_addr);
     tracing::info!("  QUIC: {}", quic_addr);
+    tracing::info!("  TCP:  {}", tcp_addr);
 
     let grpc_tracker = tracker.clone();
+    let tcp_tracker = tracker.clone();
     let grpc_handle = tokio::spawn(async move {
         let svc = BlasterGrpcService::new(grpc_tracker);
         tracing::info!("gRPC server listening on {}", grpc_addr);
@@ -58,9 +65,14 @@ async fn main() -> anyhow::Result<()> {
         quic_server::run_quic_server(quic_addr, tracker).await
     });
 
+    let tcp_handle = tokio::spawn(async move {
+        tcp_server::run_tcp_server(tcp_addr, tcp_tracker).await
+    });
+
     tokio::select! {
         r = grpc_handle => { r??; }
         r = quic_handle => { r??; }
+        r = tcp_handle => { r??; }
     }
 
     Ok(())
